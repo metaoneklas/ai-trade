@@ -3,12 +3,21 @@ import time
 import pandas as pd
 import numpy as np
 import os
+import sys
+
+if len(sys.argv) > 1:
+    SYMBOL = sys.argv[1]
+else:
+    SYMBOL = 'BTC/USDT'
+
+# Puliamo il simbolo per il nome del file (BTC/USDT -> BTCUSDT)
+clean_symbol = SYMBOL.replace('/', '')
+FILE_NAME = f'training_data_{clean_symbol}.csv'
 
 # ================= CONFIGURAZIONE =================
 SYMBOL = 'BTC/USDT'
 EXCHANGE = ccxt.bingx()
 DEPTH = 20
-FILE_NAME = 'training_data.csv'
 LOOK_AHEAD = 60            
 TARGET_PROFIT = 0.0004     
 TIMEFRAME = '1m'
