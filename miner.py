@@ -12,7 +12,7 @@ else:
 
 # Puliamo il simbolo per il nome del file (BTC/USDT -> BTCUSDT)
 clean_symbol = SYMBOL.replace('/', '')
-FILE_NAME = f'training_data_{clean_symbol}.csv'
+FILE_NAME = f'data/training_data_{clean_symbol}.csv'
 
 # ================= CONFIGURAZIONE =================
 SYMBOL = 'BTC/USDT'
