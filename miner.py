@@ -15,9 +15,9 @@ SYMBOL = "BNB-USDT"
 FILE_NAME = 'training_data_max_gain.csv'
 LOOK_AHEAD = 20             # Finestra temporale (secondi)
 LOOK_BACK = 1.0             # Finestra Momentum (secondi)
-MIN_SAMPLE_INTERVAL = 1     # Campionamento max 10Hz
-ROLLING_WINDOW = 50         # Memoria CVD
-BATCH_SIZE = 50             # Scrittura su disco ogni 50 righe (salva CPU/IO)
+MIN_SAMPLE_INTERVAL = 0.5     # Campionamento max 10Hz
+ROLLING_WINDOW = 20         # Memoria CVD
+BATCH_SIZE = 10             # Scrittura su disco ogni 50 righe (salva CPU/IO)
 PRICE_TOL = 1e-9
 # ========================================================================
 
