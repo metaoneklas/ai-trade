@@ -1,174 +1,238 @@
-import ccxt
+import websocket
+import threading
 import time
+import json
+import gzip
+import io
 import pandas as pd
 import numpy as np
 import os
-import sys
-
-if len(sys.argv) > 1:
-    SYMBOL = sys.argv[1]
-else:
-    SYMBOL = 'BTC/USDT'
-
-# Puliamo il simbolo per il nome del file (BTC/USDT -> BTCUSDT)
-clean_symbol = SYMBOL.replace('/', '')
-FILE_NAME = f'data/training_data_{clean_symbol}.csv'
+from collections import deque
 
 # ================= CONFIGURAZIONE =================
-SYMBOL = 'BTC/USDT'
-EXCHANGE = ccxt.bingx()
-DEPTH = 20
-LOOK_AHEAD = 60            
-TARGET_PROFIT = 0.0004     
-TIMEFRAME = '1m'
+SYMBOL = "BNB-USDT" 
+FILE_NAME = 'training_data_context.csv'
+LOOK_AHEAD = 10             # Target 10s
+TARGET_PROFIT = 0.0003      # 0.03%
+VOL_FILTER = 500            # Filtro Volume ($)
+ROLLING_WINDOW = 6          # Quanti cicli da 0.5s accumulare per il CVD (6 * 0.5 = 3 secondi)
 # ==================================================
 
-def calculate_indicators(closes):
-    series = pd.Series(closes)
-    # RSI (0-1 Normalized)
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    rsi = 100 - (100 / (1 + rs))
-    current_rsi = rsi.iloc[-1] if not np.isnan(rsi.iloc[-1]) else 50
-    return current_rsi / 100.0, 0 # Ritorniamo solo RSI per semplicità qui, o aggiungi SMA se vuoi
+# --- MEMORIA CONDIVISA (Invariata) ---
+class SharedState:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.latest_book = None
+        self.trade_bucket = []
 
-def get_normalized_features():
+    def update_book(self, book_data):
+        with self.lock:
+            if book_data and isinstance(book_data, dict):
+                self.latest_book = book_data
+
+    def add_trades(self, trade_list):
+        with self.lock:
+            if not trade_list or not isinstance(trade_list, list): return
+            for t in trade_list:
+                try:
+                    side = 'sell' if t.get('m', False) else 'buy'
+                    self.trade_bucket.append({
+                        'p': float(t['p']), 'q': float(t['q']), 'side': side, 't': t['T']
+                    })
+                except: pass
+
+shared = SharedState()
+
+# --- WEBSOCKET CLASS (Invariata - Robusta) ---
+class BingXSocket(threading.Thread):
+    def __init__(self, url, channel):
+        super().__init__()
+        self.url = url
+        self.channel = channel
+        self.ws = None
+        self.keep_running = True
+        self.daemon = True 
+
+    def on_open(self, ws):
+        print(f"🔌 Connected {self.channel['dataType']}")
+        ws.send(json.dumps(self.channel))
+
+    def on_message(self, ws, message):
+        try:
+            compressed_data = gzip.GzipFile(fileobj=io.BytesIO(message), mode='rb')
+            utf8_data = compressed_data.read().decode('utf-8')
+            if utf8_data == "Ping":
+                ws.send("Pong")
+                return
+            data = json.loads(utf8_data)
+            if 'data' in data and data['data'] is not None:
+                dtype = self.channel['dataType']
+                if "trade" in dtype: shared.add_trades(data['data'])
+                elif "depth" in dtype: shared.update_book(data['data'])
+        except: pass
+
+    def run(self):
+        while self.keep_running:
+            try:
+                self.ws = websocket.WebSocketApp(self.url, on_open=self.on_open, on_message=self.on_message)
+                self.ws.run_forever()
+            except: time.sleep(5)
+
+# --- MAIN LOGIC CON MEMORIA ---
+def main_miner():
+    URL = "wss://open-api-swap.bingx.com/swap-market"
+    BingXSocket(URL, {"id": "t", "reqType": "sub", "dataType": f"{SYMBOL}@trade"}).start()
+    BingXSocket(URL, {"id": "d", "reqType": "sub", "dataType": f"{SYMBOL}@depth5@500ms"}).start()
+
+    print("--- ⛏️ MINER V6: Context & Microstructure ---")
+    print("Features: [OBI, d_OBI, LogVol, Roll_CVD, Ice_Bid, Ice_Ask, Spread, d_Spread, Micro_Div]")
+    time.sleep(3)
+
+    cols = [
+        'obi', 'd_obi',         # Imbalance + Variazione
+        'log_vol',              # Volume
+        'roll_cvd',             # CVD Accumulato 3s
+        'ice_bid', 'ice_ask',   # Iceberg
+        'spread', 'd_spread',   # Spread + Variazione (Squeeze)
+        'micro_div',            # Divergenza Prezzo/MicroPrezzo
+        'target'
+    ]
+    
+    if not os.path.exists(FILE_NAME):
+        pd.DataFrame(columns=cols).to_csv(FILE_NAME, index=False)
+
+    buffer = []         # Per il salvataggio CSV (Targeting)
+    
+    # MEMORIA STORICA
+    prev_state = None   # Per calcolare i Delta (t vs t-1)
+    prev_book_snap = None # Per calcolare Iceberg
+    cvd_deque = deque(maxlen=ROLLING_WINDOW) # Per il Rolling CVD
+
     try:
-        book = EXCHANGE.fetch_order_book(SYMBOL, limit=DEPTH)
-        trades = EXCHANGE.fetch_trades(SYMBOL, limit=100)
-        ticker = EXCHANGE.fetch_ticker(SYMBOL)
-        ohlcv = EXCHANGE.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=30)
-        
-        # --- ORDER BOOK ---
-        asks_p = np.array([x[0] for x in book['asks']]) 
-        asks_v = np.array([x[1] for x in book['asks']]) 
-        bids_p = np.array([x[0] for x in book['bids']])
-        bids_v = np.array([x[1] for x in book['bids']])
-        asks_usd = asks_p * asks_v
-        bids_usd = bids_p * bids_v
-        
-        features = []
-        
-        def calc_obi(bid_val, ask_val):
-            t = bid_val + ask_val
-            return (bid_val - ask_val) / t if t > 0 else 0
+        while True:
+            # 1. Thread-Safe Snapshot
+            with shared.lock:
+                if shared.latest_book is None:
+                    time.sleep(0.5)
+                    continue
+                current_book = shared.latest_book.copy()
+                recent_trades = shared.trade_bucket[:]
+                shared.trade_bucket = [] 
 
-        # Features 0-4: OBI (Range -1 a 1)
-        features.append(calc_obi(bids_usd[0], asks_usd[0])) 
-        features.append(calc_obi(bids_usd[1], asks_usd[1])) 
-        features.append(calc_obi(bids_usd[2], asks_usd[2])) 
-        features.append(calc_obi(np.sum(bids_usd[3:10]), np.sum(asks_usd[3:10]))) 
-        features.append(calc_obi(np.sum(bids_usd[10:20]), np.sum(asks_usd[10:20]))) 
-        
-        # Features 5-6: Concentrazione (Range 0 a 1)
-        features.append(bids_usd[0] / (np.sum(bids_usd) + 1)) 
-        features.append(asks_usd[0] / (np.sum(asks_usd) + 1)) 
-        
-        # --- VOLUME & ICEBERG ---
-        now = EXCHANGE.milliseconds()
-        recent = [t for t in trades if t['timestamp'] > (now - 5000)]
-        buy_usd = sum([t['cost'] if t.get('cost') else t['amount']*t['price'] for t in recent if t['side']=='buy'])
-        sell_usd = sum([t['cost'] if t.get('cost') else t['amount']*t['price'] for t in recent if t['side']=='sell'])
-        vol_usd = buy_usd + sell_usd
-        
-        # --- MODIFICA RICHIESTA: NORMALIZZAZIONE MANUALE / 10 ---
-        # Log10(Vol) diviso per 10. Max teorico 10 Miliardi.
-        # Range risultante: 0.0 - 1.0
-        log_vol = np.log10(vol_usd + 1)
-        features.append(log_vol / 10.0) # Feat 7
-        
-        # CVD (Range -1 a 1)
-        features.append((buy_usd - sell_usd) / vol_usd if vol_usd > 0 else 0) # Feat 8
-        
-        # Iceberg (Log naturale)
-        # Questi rimangono grezzi (log1p) perché raramente superano 3-4
-        # Il Trainer gestirà questi piccoli sbalzi
-        features.append(np.log1p(sell_usd / (bids_usd[0] + 1))) # Feat 9
-        features.append(np.log1p(buy_usd / (asks_usd[0] + 1))) # Feat 10
-        
-        # --- MACRO ---
-        closes = [c[4] for c in ohlcv]
-        rsi_norm, _ = calculate_indicators(closes)
-        
-        # Calcolo distanza SMA semplice inline
-        sma = pd.Series(closes).rolling(14).mean().iloc[-1]
-        dist_sma = (closes[-1] - sma) / sma if sma > 0 else 0
-        
-        # Calcolo Candle Change
-        last_candle = ohlcv[-2]
-        candle_change = (last_candle[4] - last_candle[1]) / last_candle[1]
-        
-        features.append(rsi_norm)      # Feat 11 (0-1)
-        features.append(dist_sma)      # Feat 12 (Piccolo float)
-        features.append(candle_change) # Feat 13 (Piccolo float)
-        
-        return features, ticker['last']
-        
-    except Exception as e:
-        return None, None
+            # Parsing
+            try:
+                bids = current_book.get('bids', [])
+                asks = current_book.get('asks', [])
+                if not bids or not asks: continue
 
-print(f"--- ⛏️ MINER V8: Manual Normalization (/10) ---")
+                best_bid_p = float(bids[0][0])
+                best_bid_q = float(bids[0][1])
+                best_ask_p = float(asks[0][0])
+                best_ask_q = float(asks[0][1])
+                
+                # Walls (Top 5 levels)
+                sum_bid5 = sum([float(x[1]) for x in bids[:5]])
+                sum_ask5 = sum([float(x[1]) for x in asks[:5]])
+            except: continue
 
-# Colonne CSV
-cols = [
-    'obi_1', 'obi_2', 'obi_3', 'obi_near', 'obi_far',        
-    'bid_conc', 'ask_conc',                                  
-    'log_vol_norm', 'cvd',                                        
-    'bid_ice', 'ask_ice',                                    
-    'rsi', 'dist_sma', 'candle_change',                      
-    'momentum_1s',
-    'target'                                                 
-]
+            # --- 2. Feature Calculation ---
 
-if not os.path.exists(FILE_NAME):
-    pd.DataFrame(columns=cols).to_csv(FILE_NAME, index=False)
+            # A. Basic Metrics
+            obi = (sum_bid5 - sum_ask5) / (sum_bid5 + sum_ask5) if (sum_bid5 + sum_ask5) > 0 else 0
+            spread = best_ask_p - best_bid_p
+            
+            # B. Volume & Rolling CVD
+            buy_vol = sum([t['p'] * t['q'] for t in recent_trades if t['side'] == 'buy'])
+            sell_vol = sum([t['p'] * t['q'] for t in recent_trades if t['side'] == 'sell'])
+            tick_vol = buy_vol + sell_vol
+            tick_net = buy_vol - sell_vol # Netto di questo 0.5s
+            
+            # Aggiungiamo alla coda rotante
+            cvd_deque.append(tick_net)
+            
+            # Calcoliamo la somma degli ultimi N cicli (es. 3 secondi)
+            rolling_net_vol = sum(cvd_deque)
+            # Normalizziamo su scala logaritmica/relativa per non avere numeri enormi
+            # Usiamo una tanh per tenerlo tra -1 e 1 approssimativamente
+            rolling_cvd_norm = np.tanh(rolling_net_vol / 10000) # Assumendo 10k come volume alto
 
-buffer = []
-prev_loop_price = None 
+            # C. Iceberg (Come V5)
+            ice_bid = 0.0
+            ice_ask = 0.0
+            if prev_book_snap:
+                if best_bid_p == prev_book_snap['bid_p']:
+                    delta_v = prev_book_snap['bid_q'] - best_bid_q
+                    sell_exec = sum([t['q'] for t in recent_trades if t['side']=='sell'])
+                    if sell_exec > delta_v + 0.0001: ice_bid = np.log1p(sell_exec - delta_v)
+                
+                if best_ask_p == prev_book_snap['ask_p']:
+                    delta_v = prev_book_snap['ask_q'] - best_ask_q
+                    buy_exec = sum([t['q'] for t in recent_trades if t['side']=='buy'])
+                    if buy_exec > delta_v + 0.0001: ice_ask = np.log1p(buy_exec - delta_v)
 
-while True:
-    feats, current_price = get_normalized_features()
-    
-    if not feats:
-        time.sleep(1)
-        continue
-        
-    current_time = time.time()
-    
-    # Calcolo Momentum
-    if prev_loop_price is None:
-        momentum = 0.0 
-    else:
-        momentum = (current_price - prev_loop_price) / prev_loop_price
-        
-    prev_loop_price = current_price
-    feats.append(momentum) # Feat 14 (Totale 15 inputs)
-    
-    # Buffer
-    buffer.append({'f': feats, 'p': current_price, 't': current_time})
-    
-    # Process Buffer
-    for item in buffer[:]:
-        if current_time - item['t'] >= LOOK_AHEAD:
-            
-            past_price_abs = item['p']
-            future_price_abs = current_price 
-            
-            # Target
-            is_profitable = 1 if future_price_abs > (past_price_abs * (1 + TARGET_PROFIT)) else 0
-            
-            # Save
-            row = item['f'] + [is_profitable]
-            df_row = pd.DataFrame([row], columns=cols)
-            df_row.to_csv(FILE_NAME, mode='a', header=False, index=False)
-            
-            # Print (Mostriamo il LogVol normalizzato per verifica)
-            vol_norm = item['f'][7] 
-            res = "WIN 🟢" if is_profitable else "NO  🔴"
-            print(f"{res} | Vol(0-1): {vol_norm:.2f} | Ice: {item['f'][9]:.2f}", end='\r')
-            
-            buffer.remove(item)
-            
-    time.sleep(1)
+            # D. Micro-Price Divergence (NEW!)
+            # Il prezzo "vero" considerando dove sta il peso del volume
+            mid_price = (best_bid_p + best_ask_p) / 2
+            # Formula Microprice: (BidP * AskQ + AskP * BidQ) / (BidQ + AskQ)
+            denom = best_bid_q + best_ask_q
+            if denom > 0:
+                micro_price = (best_bid_p * best_ask_q + best_ask_p * best_bid_q) / denom
+                # Divergenza: Se micro > mid, pressione buy
+                micro_div = (micro_price - mid_price)
+            else:
+                micro_div = 0
+
+            # E. DELTAS (Variazione rispetto al ciclo precedente)
+            if prev_state:
+                d_obi = obi - prev_state['obi']
+                d_spread = spread - prev_state['spread']
+            else:
+                d_obi = 0
+                d_spread = 0
+
+            # --- Aggiornamento Stati ---
+            prev_state = {'obi': obi, 'spread': spread}
+            prev_book_snap = {'bid_p': best_bid_p, 'bid_q': best_bid_q, 'ask_p': best_ask_p, 'ask_q': best_ask_q}
+
+            # --- 3. Save Logic ---
+            # Filtro: O volume, O iceberg, O cambio forte di OBI
+            has_activity = (tick_vol > VOL_FILTER) or (ice_bid > 0.1) or (ice_ask > 0.1) or (abs(d_obi) > 0.2)
+
+            if has_activity:
+                feats = [
+                    round(obi, 4),
+                    round(d_obi, 4),        # NEW: Direzione del muro
+                    round(np.log10(tick_vol + 1), 4),
+                    round(rolling_cvd_norm, 4), # NEW: Pressione ultimi 3s
+                    round(ice_bid, 4),
+                    round(ice_ask, 4),
+                    round(spread, 2),
+                    round(d_spread, 2),     # NEW: Spread Squeeze
+                    round(micro_div, 2)     # NEW: Microstructure pressure
+                ]
+                
+                buffer.append({'f': feats, 'p': best_bid_p, 't': time.time()})
+                
+                # Log contestuale
+                trend = "↗️" if d_obi > 0.05 else ("↘️" if d_obi < -0.05 else "➡️")
+                print(f"OBI:{obi:.2f} ({trend}) | CVD_3s:{rolling_net_vol/1000:.1f}k | IceB:{ice_bid:.1f}", end='\r')
+
+            else:
+                print(f"Listening... {best_bid_p:.1f}", end='\r')
+
+            # --- 4. Target Check ---
+            now = time.time()
+            for item in buffer[:]:
+                if now - item['t'] >= LOOK_AHEAD:
+                    is_profit = 1 if best_bid_p > (item['p'] * (1 + TARGET_PROFIT)) else 0
+                    row = item['f'] + [is_profit]
+                    pd.DataFrame([row], columns=cols).to_csv(FILE_NAME, mode='a', header=False, index=False)
+                    buffer.remove(item)
+
+            time.sleep(0.5)
+
+    except KeyboardInterrupt:
+        print("\n🛑 Stopped.")
+
+if __name__ == "__main__":
+    main_miner()
