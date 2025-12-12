@@ -10,15 +10,16 @@ import os
 from collections import deque
 from typing import List, Dict, Any
 
-# ================= CONFIGURAZIONE V11 (CLEAN & STABLE) =================
+# ================= CONFIGURAZIONE V12 (MAX GAIN TARGET) =================
 SYMBOL = "BNB-USDT"
-FILE_NAME = 'training_data_neural.csv'
-LOOK_AHEAD = 20             # Target futuro (secondi)
+FILE_NAME = 'training_data_max_gain.csv'
+LOOK_AHEAD = 20             # Finestra temporale (secondi)
 LOOK_BACK = 1.0             # Finestra Momentum (secondi)
-MIN_SAMPLE_INTERVAL = 1   # Campionamento max 10Hz (evita ridondanza)
-ROLLING_WINDOW = 50         # Aumentato: Memoria degli ultimi 50 trade attivi
+MIN_SAMPLE_INTERVAL = 1     # Campionamento max 10Hz
+ROLLING_WINDOW = 50         # Memoria CVD
+BATCH_SIZE = 50             # Scrittura su disco ogni 50 righe (salva CPU/IO)
 PRICE_TOL = 1e-9
-# =======================================================================
+# ========================================================================
 
 class SharedState:
     def __init__(self):
@@ -87,32 +88,37 @@ def init_csv(filename, cols):
         pd.DataFrame(columns=cols).to_csv(filename, index=False)
         print(f"📁 Created file: {filename}")
 
-def append_row(filename, row, cols):
-    pd.DataFrame([row], columns=cols).to_csv(filename, mode='a', header=False, index=False, float_format='%.10f')
+# --- BATCH WRITER PER PERFORMANCE ---
+def flush_batch(filename, batch_data, cols):
+    if not batch_data: return
+    df = pd.DataFrame(batch_data, columns=cols)
+    df.to_csv(filename, mode='a', header=False, index=False, float_format='%.10f')
 
-# ------------------ MAIN MINER V11 ------------------
-def main_miner_clean():
+# ------------------ MAIN MINER V12 ------------------
+def main_miner_max_gain():
     URL = "wss://open-api-swap.bingx.com/swap-market"
     BingXSocket(URL, {"id": "t", "reqType": "sub", "dataType": f"{SYMBOL}@trade"}).start()
     BingXSocket(URL, {"id": "d", "reqType": "sub", "dataType": f"{SYMBOL}@depth5@200ms"}).start()
 
+    # Features + Target (max_gain)
     cols = [
         'obi', 'd_obi', 'log_vol', 'roll_cvd', 'd_cvd', 
         'ice_bid', 'ice_ask', 'spread', 'micro_div', 
-        'past_ret', 'mid_price', 'future_ret'
+        'past_ret', 'mid_price', 'target_max_gain' 
     ]
     init_csv(FILE_NAME, cols)
     
-    print(f"--- ⛏️ MINER V11: CLEAN & STABLE ({SYMBOL}) ---")
-    print("Logica CVD: Event-Based (Non va a zero nel silenzio)")
+    print(f"--- ⛏️ MINER V12: MAX GAIN TARGET ({SYMBOL}) ---")
+    print(f"Target: Massimo rialzo % nei successivi {LOOK_AHEAD}s")
     
-    buffer = deque(maxlen=5000)
+    # Strutture dati
+    buffer = deque()            # Contiene i sample in attesa di maturazione
+    write_queue = []            # Contiene i dati pronti per il CSV (Batching)
     history_prices = deque(maxlen=200)
-    
-    # CVD State
     cvd_deque = deque(maxlen=ROLLING_WINDOW)
-    prev_cvd = 0.0
     
+    # Variabili stato
+    prev_cvd_sum = 0.0
     prev_state = {'obi': 0.0}
     prev_book_snap = None
     last_sample_time = 0
@@ -121,9 +127,9 @@ def main_miner_clean():
         cycle_start = time.time()
         current_book, recent_trades = shared.pop_snapshot()
 
-        # Attesa dati iniziale
         if not current_book:
-            time.sleep(0.1); continue
+            time.sleep(0.01)
+            continue
 
         try:
             bids = current_book.get('bids', []); asks = current_book.get('asks', [])
@@ -135,33 +141,40 @@ def main_miner_clean():
             sum_ask5 = sum([float(x[1]) for x in asks[:5]])
         except: continue
 
-        # --- FEATURES ---
         mid_price = (best_bid_p + best_ask_p) / 2.0
-        spread = best_ask_p - best_bid_p
-        history_prices.append({'t': time.time(), 'p': mid_price})
+        curr_time = time.time()
+        
+        # --- 1. AGGIORNAMENTO MAX_PRICE NEL BUFFER (CRUCIALE) ---
+        # Ogni elemento nel buffer "vede" il prezzo attuale.
+        # Se il prezzo attuale è > del massimo visto finora, aggiorniamo.
+        for item in buffer:
+            if mid_price > item['max_p']:
+                item['max_p'] = mid_price
 
-        # 1. OBI
+        # --- 2. CALCOLO FEATURES ---
+        spread = best_ask_p - best_bid_p
+        history_prices.append({'t': curr_time, 'p': mid_price})
+
+        # OBI
         obi = (sum_bid5 - sum_ask5) / (sum_bid5 + sum_ask5) if (sum_bid5 + sum_ask5) > 0 else 0.0
         d_obi = obi - prev_state['obi']
 
-        # 2. Volume & CVD (FIXED LOGIC)
+        # CVD Efficiente
         buy_vol = sum([t['p']*t['q'] for t in recent_trades if t['side']=='buy'])
         sell_vol = sum([t['p']*t['q'] for t in recent_trades if t['side']=='sell'])
         tick_vol = buy_vol + sell_vol
         net_vol = buy_vol - sell_vol
 
-        # FIX: Aggiorniamo la deque SOLO se c'è volume. 
-        # Se il mercato tace, manteniamo la memoria della pressione precedente.
         if tick_vol > 0:
+            if len(cvd_deque) == ROLLING_WINDOW:
+                removed = cvd_deque.popleft()
+                prev_cvd_sum -= removed # Aggiornamento incrementale
             cvd_deque.append(net_vol)
+            prev_cvd_sum += net_vol
         
-        current_roll_cvd = sum(cvd_deque) # Somma degli ultimi 50 trade ATTIVI
-        d_cvd = current_roll_cvd - prev_cvd
-        
-        if tick_vol > 0: # Aggiorniamo prev_cvd solo se è cambiato qualcosa
-            prev_cvd = current_roll_cvd
+        d_cvd = prev_cvd_sum - (prev_cvd_sum - net_vol if tick_vol > 0 else prev_cvd_sum)
 
-        # 3. Iceberg
+        # Iceberg Logic
         ice_bid = 0.0; ice_ask = 0.0
         if prev_book_snap:
             if abs(best_bid_p - prev_book_snap['bid_p']) < PRICE_TOL:
@@ -174,67 +187,74 @@ def main_miner_clean():
                 exec_vol = sum([t['q'] for t in recent_trades if t['side']=='buy' and abs(t['p']-best_ask_p)<PRICE_TOL])
                 if (exec_vol - delta) > 0.0001: ice_ask = exec_vol - delta
 
-        # 4. MicroPrice & Momentum
+        # MicroPrice & Momentum
         denom = best_bid_q + best_ask_q
         micro_price = (best_bid_p * best_ask_q + best_ask_p * best_bid_q) / denom if denom > 0 else mid_price
         micro_div = micro_price - mid_price
 
         past_ret = 0.0
-        curr_time = time.time()
         for h in history_prices:
             if curr_time - h['t'] <= LOOK_BACK:
                 past_ret = (mid_price - h['p']) / h['p']
                 break
 
-        # Update States
         prev_state['obi'] = obi
         prev_book_snap = {'bid_p': best_bid_p, 'bid_q': best_bid_q, 'ask_p': best_ask_p, 'ask_q': best_ask_q}
 
-        # --- BUFFERING ---
+        # --- 3. CREAZIONE NUOVO SAMPLE ---
         if (curr_time - last_sample_time) > MIN_SAMPLE_INTERVAL:
             last_sample_time = curr_time
             
             feats = [
                 obi, d_obi, 
                 np.log10(tick_vol+1), 
-                current_roll_cvd, 
+                prev_cvd_sum, 
                 d_cvd,
                 ice_bid, ice_ask, 
                 spread, micro_div, 
                 past_ret, 
-                mid_price # Serve per calcolo target, verrà tolta nel training
+                mid_price 
             ]
-            buffer.append({'f': feats, 'p': mid_price, 't': curr_time})
             
-            # Clean Status Print
-            print(f"🟢 RUNNING | P:{mid_price:.2f} | CVD:{current_roll_cvd:.0f} | Buffer:{len(buffer)}   ", end='\r')
+            # Inizializziamo 'max_p' con il prezzo attuale
+            buffer.append({
+                'f': feats, 
+                'p_entry': mid_price, 
+                't': curr_time, 
+                'max_p': mid_price # High Watermark iniziale
+            })
 
-        # --- TARGET & WRITE ---
-        now = time.time()
-        # Copia sicura per iterare e rimuovere
-        pending = list(buffer)
-        
-        for item in pending:
-            if now - item['t'] >= LOOK_AHEAD:
-                past_p = item['p']
-                curr_p = mid_price
-                # Calcolo Target
-                ret_pct = (curr_p - past_p) / past_p
+            print(f"🟢 BUFFER:{len(buffer)} | WRITE_Q:{len(write_queue)} | P:{mid_price:.2f}   ", end='\r')
+
+        # --- 4. CONTROLLO TARGET MATURATI (FIFO) ---
+        # Controlliamo solo la testa della coda (efficienza massima)
+        while len(buffer) > 0:
+            head_item = buffer[0]
+            if curr_time - head_item['t'] >= LOOK_AHEAD:
+                # Il tempo è scaduto. Il target è il MAX raggiunto diviso l'entry
+                max_gain_pct = (head_item['max_p'] - head_item['p_entry']) / head_item['p_entry']
                 
-                # Sostituiamo l'ultimo elemento (mid_price) con il target (future_ret)
-                # O meglio: aggiungiamo il target alla fine
-                # La lista 'feats' ha mid_price in ultima posizione [-1]
-                # Salviamo tutto per sicurezza, poi pandas filtra
-                row = item['f'] + [ret_pct]
+                # Sostituiamo l'ultima colonna (mid_price entry) con il target
+                final_row = head_item['f'][:-1] + [head_item['p_entry']] + [max_gain_pct] 
+                # Nota: ho mantenuto mid_price e aggiunto il target alla fine per chiarezza,
+                # ma nel 'cols' sopra ho messo 'mid_price' e 'target_max_gain', quindi siamo allineati.
                 
-                append_row(FILE_NAME, row, cols)
-                buffer.remove(item)
+                write_queue.append(final_row)
+                buffer.popleft() # Rimuovi dalla testa
+            else:
+                break # Se il primo non è maturo, neanche gli altri lo sono
+
+        # --- 5. BATCH WRITING ---
+        if len(write_queue) >= BATCH_SIZE:
+            flush_batch(FILE_NAME, write_queue, cols)
+            write_queue = []
 
         elapsed = time.time() - cycle_start
-        if elapsed < 0.05: time.sleep(0.05)
+        if elapsed < 0.01: time.sleep(0.01)
 
 if __name__ == "__main__":
     try:
-        main_miner_clean()
+        main_miner_max_gain()
     except KeyboardInterrupt:
-        print("\n🛑 Stopped.")
+        print("\n🛑 Stopped. Saving remaining data...")
+        # Qui potresti aggiungere un flush finale se vuoi salvare i dati parziali
