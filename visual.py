@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 import os
 
 # Configurazione
-FILE_NAME = 'training_data_final.csv'
+FILE_NAME = 'trade.csv'
 OUTPUT_IMAGE = 'correlation_analysis.png'
 
 def main_visual():
