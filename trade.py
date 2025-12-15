@@ -52,7 +52,7 @@ class BingXHedgeSniper:
             logging.warning(f"⚠️ Modello {MODEL_FILE} non trovato. Solo test API possibili.")
             self.model = None
         else:
-            self.model = xgb.XGBRegressor()
+            self.model = xgb.Booster()
             self.model.load_model(MODEL_FILE)
             logging.info(f"🤖 Modello caricato: {MODEL_FILE}")
         
@@ -232,7 +232,8 @@ class BingXHedgeSniper:
                     continue
 
                 # 3. Entry Logic
-                pred_bps = self.model.predict(features)[0]
+                dmatrix = xgb.DMatrix(features)
+                pred_bps = self.model.predict(dmatrix)[0]
                 
                 if abs(pred_bps) > ENTRY_THRESHOLD_BPS:
                     direction = 'LONG' if pred_bps > 0 else 'SHORT'
