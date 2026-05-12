@@ -15,7 +15,7 @@ then
 fi
 
 # Create venv
-python3 -m venv $VENV_NAME
+virtualenv $VENV_NAME
 
 # Check if creation was successful
 if [ ! -d "$VENV_NAME" ]; then
