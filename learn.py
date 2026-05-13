@@ -1,66 +1,68 @@
-import random
-import numpy as np
 import polars as pl
-from src.data.loader import TradingDataLoader
-from src.environment.trading_env import TradingEnv
 from stable_baselines3 import PPO
-from stable_baselines3.common.env_util import make_vec_env
-from typing import Optional
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+from stable_baselines3.common.callbacks import CheckpointCallback
+from src.environment.trading_env import TradingEnv
 
-def set_seed(seed: int = 42):
-    """Sets the seed for reproducibility."""
-    random.seed(seed)
-    np.random.seed(seed)
-    # torch.manual_seed(seed) if torch is used directly
-    print(f"[*] Seed set to {seed}")
+import os
 
-def main(data_path: Optional[str] = None):
-    set_seed(42)
+def main():
+    data_path = "data/processed_rl_data.parquet"
+    if not os.path.exists(data_path):
+        raise FileNotFoundError(f"Cannot find {data_path}. Run preprocess.py first.")
 
-    # 1. Load and Preprocess Data
-    print("[*] Loading data...")
-    # For now, we assume data exists in data/trades and data/orderbook
-    # If not, we'll catch the error and suggest gathering data first.
-    try:
-        loader = TradingDataLoader()
-        df = loader.load_aligned_data()
-        
-        # Take a subset or full dataset
-        # processed_df = loader.preprocess_for_rl(df.head(10000))
-        processed_df = loader.preprocess_for_rl(df)
-        
-        print(f"[*] Data loaded: {len(processed_df)} records.")
-    except Exception as e:
-        print(f"[!] Error loading data: {e}")
-        print("[!] Make sure you have collected data using gather.py and it's stored in data/trades and data/orderbook.")
-        return
+    print("[*] Loading preprocessed data...")
+    df = pl.read_parquet(data_path)
+    
+    # 1. Temporal Split (80/20) - DO NOT SHUFFLE TRADING DATA
+    train_size = int(len(df) * 0.8)
+    train_df = df.slice(0, train_size)
+    val_df = df.slice(train_size, len(df) - train_size)
+    print(f"[*] Train set: {len(train_df)} rows. Validation set: {len(val_df)} rows.")
 
-    # 2. Initialize Environment
-    print("[*] Initializing Environment...")
-    env = TradingEnv(processed_df)
+    # 2. Vectorize and Normalize Environment
+    # Using 4 parallel environments speeds up trajectory collection
+    env_maker = lambda: TradingEnv(train_df)
+    vec_env = DummyVecEnv([env_maker for _ in range(4)])
+    
+    # CRITICAL: Normalize observations so the Neural Network doesn't blow up
+    vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, clip_obs=10.)
 
-    # 3. Build Model (Template)
-    print("[*] Building RL Model (PPO)...")
+    # 3. Define PPO Model for Real-World Noise
+    print("[*] Initializing PPO Agent...")
     model = PPO(
         "MlpPolicy", 
-        env, 
+        vec_env, 
         verbose=1, 
         tensorboard_log="./logs/ppo_trading/",
-        learning_rate=0.0003,
-        n_steps=2048,
-        batch_size=64,
-        n_epochs=10,
-        gamma=0.99,
+        learning_rate=5e-5,        # Low LR for volatile market data
+        n_steps=4096,              # Large batch of steps per update
+        batch_size=256,
+        n_epochs=5,                # Low epochs to prevent overfitting
+        gamma=0.99,                # Future reward discount
+        clip_range=0.1,            # Tighter clipping for stability
+        ent_coef=0.01,             # Entropy to encourage exploration
+        device="auto"              # Uses GPU if available
     )
 
-    # 4. Training (Optional/Template)
-    # print("[*] Starting Training...")
-    # model.learn(total_timesteps=100000)
-    # model.save("models/ppo_trading_bot")
-    # print("[*] Model saved to models/ppo_trading_bot")
+    # Save a checkpoint every 500,000 steps
+    checkpoint_callback = CheckpointCallback(
+        save_freq=125_000, # 125k * 4 envs = 500k timesteps
+        save_path='./models/checkpoints/',
+        name_prefix='ppo_trading'
+    )
 
-    print("[*] Environment and model ready.")
-    return env, model
+    # 4. Train Model
+    print("[*] Starting Training Loop...")
+    os.makedirs("models", exist_ok=True)
+    
+    # 2,000,000 timesteps is a good starting point for ~700k train rows
+    model.learn(total_timesteps=2_000_000, callback=checkpoint_callback) 
+    
+    # 5. Save Final Model & Normalization Stats
+    model.save("models/ppo_trading_final")
+    vec_env.save("models/vec_normalize.pkl")
+    print("[+] Training Complete. Model and Normalization stats saved to /models/")
 
 if __name__ == "__main__":
     main()

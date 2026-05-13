@@ -1,3 +1,8 @@
 data/tgz
 data/orderbook
 data/trades
+all/
+__pycache__/
+logs/
+models/
+*.pyc

@@ -38,12 +38,11 @@ class TradingDataLoader:
         # Join data on timestamp using 'join_asof' for nearest match if needed, 
         # but here we assume they might be close. Given 100ms depth updates, 
         # join_asof is safer.
-        aligned_df = pl.join_asof(
-            trades_df,
+        aligned_df = trades_df.join_asof(
             ob_df,
             on="timestamp",
             strategy="backward"
-        )
+        ).drop_nulls(subset=["bids", "asks"])
 
         return aligned_df
 
